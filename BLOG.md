@@ -2,13 +2,19 @@
 
 ## Overview
 
-Pacemaker is the traditional choice for SAP HANA HA on Linux. It works, but on AWS it brings complexity: STONITH configuration, split-brain handling, cluster resource agents, and a notoriously steep learning curve. This post describes an alternative approach built entirely on AWS-native services — EventBridge, Lambda, CloudWatch, and Route 53 — that delivers automated failover and re-registration with no cluster software on the instances at all.
+I don't like Pacemaker clusters.
+
+They work until they don't and then you usually lose everything. Putting Pacemaker into a cloud-native environment has always felt like riding a horse on a motorway. STONITH configuration, split-brain handling, cluster resource agents, corosync tuning, and documentation that assumes you already know what you're doing. The learning curve is steep, the failure modes are entertaining, and none of it feels like it belongs on a cloud-based solution.
+
+So I built something different. No cluster software on the instances at all. The HA logic lives entirely in AWS-native services — EventBridge, Lambda, CloudWatch, and Route 53 — and delivers the same outcome: automated failover, HSR takeover, and automatic re-registration of the failed node as the new secondary when it recovers.
 
 The solution handles two failure scenarios:
 - **OS/instance failure** — detected in seconds via Amazon EventBridge EC2 state-change notifications
 - **HANA process crash** — detected within 30 seconds via a custom CloudWatch metric pushed by a lightweight monitor running on each node
 
-Both scenarios trigger the same automated response: HSR takeover on the surviving node, Route 53 DNS update, and automatic re-registration of the failed node as the new secondary when it recovers.
+Both trigger the same automated response: HSR takeover on the surviving node, Route 53 DNS update, re-registration of the failed node as secondary when it comes back.
+
+Full repo: https://github.com/neilaspin/hana-ha-aws
 
 ---
 
