@@ -12,5 +12,8 @@ lambda/lambda_failover.zip
 __pycache__/
 *.pyc
 
+# Blog post (published separately)
+BLOG.md
+
 # macOS
 .DS_Store
