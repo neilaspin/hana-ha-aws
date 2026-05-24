@@ -1,0 +1,231 @@
+---
+- name: Enable HSR on primary
+  hosts: primary
+  become: true
+  gather_facts: true
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+    hana_master_pw: "Hana1234!"
+    hsr_replication_mode: "syncmem"
+    hsr_operation_mode: "logreplay"
+    hsr_site_name_primary: "SITE1"
+
+  tasks:
+
+    - name: Run SYSTEMDB backup
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -d SYSTEMDB -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"BACKUP DATA USING FILE ('systemdb_backup')\"
+        "
+      changed_when: true
+
+    - name: Wait for tenant database to accept connections
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -d {{ hana_sid }} -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"SELECT 1 FROM DUMMY\"
+        "
+      register: tenant_ready
+      until: tenant_ready.rc == 0
+      retries: 20
+      delay: 30
+      changed_when: false
+
+    - name: Run tenant database backup
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -d {{ hana_sid }} -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"BACKUP DATA USING FILE ('tenant_backup')\"
+        "
+      changed_when: true
+
+    - name: Wait for SYSTEMDB backup in catalog
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -d SYSTEMDB -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"SELECT COUNT(*) FROM SYS.M_BACKUP_CATALOG WHERE ENTRY_TYPE_NAME='complete data backup' AND STATE_NAME='successful'\"
+        "
+      register: systemdb_backup_catalog
+      until: (systemdb_backup_catalog.stdout | regex_search('[1-9][0-9]*')) is not none
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Wait for tenant backup in catalog
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -d {{ hana_sid }} -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"SELECT COUNT(*) FROM SYS.M_BACKUP_CATALOG WHERE ENTRY_TYPE_NAME='complete data backup' AND STATE_NAME='successful'\"
+        "
+      register: tenant_backup_catalog
+      until: (tenant_backup_catalog.stdout | regex_search('[1-9][0-9]*')) is not none
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Check if HSR already enabled on primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "hdbnsutil -sr_state"
+      register: sr_state_check
+      changed_when: false
+
+    - name: Enable system replication on primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbnsutil -sr_enable --name={{ hsr_site_name_primary }}
+        "
+      changed_when: true
+      when: "'mode: primary' not in sr_state_check.stdout"
+      ignore_errors: true
+
+    - name: Confirm primary HSR state
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "hdbnsutil -sr_state"
+      register: sr_state_primary
+      changed_when: false
+
+    - name: Show primary HSR state
+      debug:
+        msg: "{{ sr_state_primary.stdout_lines }}"
+
+    - name: Fail if primary not in HSR primary mode
+      fail:
+        msg: "Primary HSR enable failed"
+      when: "'mode: primary' not in sr_state_primary.stdout"
+
+    - name: Copy PKI files to tmp
+      shell: |
+        cp /usr/sap/{{ hana_sid }}/SYS/global/security/rsecssfs/data/SSFS_{{ hana_sid }}.DAT /tmp/SSFS_{{ hana_sid }}.DAT
+        cp /usr/sap/{{ hana_sid }}/SYS/global/security/rsecssfs/key/SSFS_{{ hana_sid }}.KEY /tmp/SSFS_{{ hana_sid }}.KEY
+        chmod 644 /tmp/SSFS_{{ hana_sid }}.DAT /tmp/SSFS_{{ hana_sid }}.KEY
+      changed_when: true
+
+    - name: Fetch PKI DAT to control node
+      fetch:
+        src: "/tmp/SSFS_{{ hana_sid }}.DAT"
+        dest: "/tmp/SSFS_{{ hana_sid }}.DAT"
+        flat: true
+
+    - name: Fetch PKI KEY to control node
+      fetch:
+        src: "/tmp/SSFS_{{ hana_sid }}.KEY"
+        dest: "/tmp/SSFS_{{ hana_sid }}.KEY"
+        flat: true
+
+
+- name: Stop HANA on secondary and push PKI files
+  hosts: secondary
+  become: true
+  gather_facts: true
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+    hana_master_pw: "Hana1234!"
+    hsr_replication_mode: "syncmem"
+    hsr_operation_mode: "logreplay"
+    hsr_site_name_secondary: "SITE2"
+
+  tasks:
+
+    - name: Stop HANA on secondary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB stop"
+      changed_when: true
+
+    - name: Wait for HANA to fully stop
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB info" 2>&1 | grep -c hdbdaemon || true
+      register: stop_check
+      until: stop_check.stdout | int == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Push PKI DAT file to secondary
+      copy:
+        src: "/tmp/SSFS_{{ hana_sid }}.DAT"
+        dest: "/usr/sap/{{ hana_sid }}/SYS/global/security/rsecssfs/data/SSFS_{{ hana_sid }}.DAT"
+        owner: hdbadm
+        group: sapsys
+        mode: "0600"
+
+    - name: Push PKI KEY file to secondary
+      copy:
+        src: "/tmp/SSFS_{{ hana_sid }}.KEY"
+        dest: "/usr/sap/{{ hana_sid }}/SYS/global/security/rsecssfs/key/SSFS_{{ hana_sid }}.KEY"
+        owner: hdbadm
+        group: sapsys
+        mode: "0600"
+
+    - name: Register secondary with primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbnsutil -sr_register \
+            --name={{ hsr_site_name_secondary }} \
+            --remoteHost={{ primary_private_hostname }} \
+            --remoteInstance={{ hana_instance }} \
+            --replicationMode={{ hsr_replication_mode }} \
+            --operationMode={{ hsr_operation_mode }}
+        "
+      register: sr_register
+      changed_when: true
+
+    - name: Show registration output
+      debug:
+        msg: "{{ sr_register.stdout_lines }}"
+
+    - name: Start HANA on secondary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB start"
+      changed_when: true
+      async: 600
+      poll: 30
+
+
+- name: Verify replication state from primary
+  hosts: primary
+  become: true
+  gather_facts: false
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+
+  tasks:
+
+    - name: Wait for secondary to connect
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          python3 /usr/sap/{{ hana_sid }}/{{ hana_sid }}{{ hana_instance }}/exe/python_support/systemReplicationStatus.py
+        " 2>&1 || true
+      register: hsr_status
+      until: "'ACTIVE' in hsr_status.stdout or 'SYNCING' in hsr_status.stdout"
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Show replication status
+      debug:
+        msg: "{{ hsr_status.stdout_lines }}"
+
+    - name: Confirm replication is active
+      fail:
+        msg: "HSR did not reach ACTIVE or SYNCING state"
+      when: "'ACTIVE' not in hsr_status.stdout and 'SYNCING' not in hsr_status.stdout"
+
+    - name: Final replication status
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          python3 /usr/sap/{{ hana_sid }}/{{ hana_sid }}{{ hana_instance }}/exe/python_support/systemReplicationStatus.py
+        "
+      register: final_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Show final replication status
+      debug:
+        msg: "{{ final_status.stdout_lines }}"

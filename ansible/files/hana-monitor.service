@@ -1,0 +1,11 @@
+[Unit]
+Description=HANA Process Monitor
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hana_monitor.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

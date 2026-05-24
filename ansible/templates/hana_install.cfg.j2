@@ -1,0 +1,16 @@
+[Server]
+action=install
+components=server
+sid={{ hana_sid }}
+number={{ hana_instance }}
+password={{ hana_master_pw }}
+sapadm_password={{ sapadm_password }}
+system_user_password={{ hana_master_pw }}
+lss_user_password={{ lss_password }}
+lss_backup_password={{ lss_password }}
+system_usage=custom
+install_execution_mode=optimized
+sapmnt={{ hana_install_dir }}
+datapath={{ hana_data_dir }}/{{ hana_sid }}
+logpath={{ hana_log_dir }}/{{ hana_sid }}
+ignore=check_min_mem

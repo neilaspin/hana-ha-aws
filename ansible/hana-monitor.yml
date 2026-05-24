@@ -1,0 +1,24 @@
+---
+- name: Deploy HANA process monitor
+  hosts: hana
+  become: true
+
+  tasks:
+    - name: Copy monitor script
+      copy:
+        src: files/hana_monitor.sh
+        dest: /usr/local/bin/hana_monitor.sh
+        mode: '0755'
+
+    - name: Copy systemd service
+      copy:
+        src: files/hana-monitor.service
+        dest: /etc/systemd/system/hana-monitor.service
+        mode: '0644'
+
+    - name: Enable and start monitor service
+      systemd:
+        name: hana-monitor
+        enabled: true
+        state: started
+        daemon_reload: true
