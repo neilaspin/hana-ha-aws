@@ -1,0 +1,339 @@
+---
+- name: SAP HANA prerequisites and installation
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+    hana_master_pw: "Hana1234!"
+    sapadm_password: "Hana1234!"
+    lss_password: "Hana1234!"
+    hana_s3_bucket: "cloudhanabucket"
+    hana_s3_prefix: "SAP_HANA_DATABASE/DATA_UNITS/HDB_SERVER_LINUX_X86_64"
+    hana_media_dir: "/hana/media"
+    hana_install_dir: "/hana/shared"
+    hana_data_dir: "/hana/data"
+    hana_log_dir: "/hana/log"
+    swap_size_mb: 20480
+
+  tasks:
+
+    - name: Confirm target is SUSE
+      fail:
+        msg: "This playbook requires SUSE Linux Enterprise Server. Got: {{ ansible_os_family }}"
+      when: ansible_os_family != 'Suse'
+
+    - name: Refresh zypper repositories
+      zypper_repository:
+        repo: '*'
+        runrefresh: true
+      ignore_errors: true
+
+    - name: Install required OS packages
+      zypper:
+        name:
+          - libaio1
+          - libaio-devel
+          - libltdl7
+          - libatomic1
+          - libnuma1
+          - numactl
+          - uuidd
+          - rsync
+          - lsof
+          - unzip
+          - xfsprogs
+          - glibc-i18ndata
+          - graphviz
+          - expect
+          - python3
+        state: present
+
+    - name: Enable and start uuidd
+      systemd:
+        name: uuidd
+        state: started
+        enabled: true
+
+    - name: Check existing swap
+      command: swapon --show=SIZE --noheadings --bytes
+      register: swap_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create swapfile
+      command: dd if=/dev/zero of=/swapfile bs=1M count={{ swap_size_mb }}
+      when: swap_check.stdout == ""
+
+    - name: Set swapfile permissions
+      file:
+        path: /swapfile
+        mode: "0600"
+      when: swap_check.stdout == ""
+
+    - name: Format swapfile
+      command: mkswap /swapfile
+      when: swap_check.stdout == ""
+
+    - name: Activate swapfile
+      command: swapon /swapfile
+      when: swap_check.stdout == ""
+
+    - name: Persist swapfile in fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/swapfile swap swap defaults 0 0"
+        state: present
+
+    - name: Set kernel parameters for HANA
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { key: "vm.max_map_count",            value: "2147483647" }
+        - { key: "kernel.sem",                   value: "1250 256000 100 8192" }
+        - { key: "net.core.somaxconn",           value: "4096" }
+        - { key: "net.ipv4.tcp_max_syn_backlog", value: "8192" }
+        - { key: "kernel.numa_balancing",        value: "0" }
+
+    - name: Set ulimits for SAP
+      copy:
+        dest: /etc/security/limits.d/99-sap.conf
+        mode: "0644"
+        content: |
+          @sapsys  soft  nofile  1048576
+          @sapsys  hard  nofile  1048576
+          @sapsys  soft  nproc   unlimited
+          @sapsys  hard  nproc   unlimited
+          @sdba    soft  nofile  1048576
+          @sdba    hard  nofile  1048576
+
+    - name: Disable THP at runtime
+      shell: |
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+      changed_when: true
+
+    - name: Create systemd unit to disable THP on boot
+      copy:
+        dest: /etc/systemd/system/disable-thp.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Disable Transparent Huge Pages
+          After=network.target
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag"
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable disable-thp service
+      systemd:
+        name: disable-thp
+        enabled: true
+        daemon_reload: true
+
+    - name: Find extra NVMe block devices (non-root, unpartitioned)
+      shell: |
+        ROOT_DEV=$(lsblk -no pkname $(findmnt -n -o SOURCE /))
+        lsblk -dno NAME | grep nvme | grep -v "^${ROOT_DEV}$" | sort
+      register: extra_nvme_devices
+      changed_when: false
+
+    - name: Fail if fewer than 3 extra volumes found
+      fail:
+        msg: "Expected 3 extra EBS volumes, found {{ extra_nvme_devices.stdout_lines | length }}"
+      when: extra_nvme_devices.stdout_lines | length < 3
+
+    - name: Set volume device facts
+      set_fact:
+        hana_data_dev: "/dev/{{ extra_nvme_devices.stdout_lines[0] }}"
+        hana_log_dev: "/dev/{{ extra_nvme_devices.stdout_lines[1] }}"
+        hana_shared_dev: "/dev/{{ extra_nvme_devices.stdout_lines[2] }}"
+
+    - name: Format HANA data volume as XFS
+      filesystem:
+        fstype: xfs
+        dev: "{{ hana_data_dev }}"
+
+    - name: Format HANA log volume as XFS
+      filesystem:
+        fstype: xfs
+        dev: "{{ hana_log_dev }}"
+
+    - name: Format HANA shared volume as XFS
+      filesystem:
+        fstype: xfs
+        dev: "{{ hana_shared_dev }}"
+
+    - name: Create HANA filesystem directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ hana_install_dir }}"
+        - "{{ hana_data_dir }}"
+        - "{{ hana_log_dir }}"
+        - "/hana/backup"
+
+    - name: Mount HANA data volume
+      mount:
+        path: "{{ hana_data_dir }}"
+        src: "{{ hana_data_dev }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted
+
+    - name: Mount HANA log volume
+      mount:
+        path: "{{ hana_log_dir }}"
+        src: "{{ hana_log_dev }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted
+
+    - name: Mount HANA shared volume
+      mount:
+        path: "{{ hana_install_dir }}"
+        src: "{{ hana_shared_dev }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted
+
+    - name: Install saptune
+      zypper:
+        name: saptune
+        state: present
+      ignore_errors: true
+
+    - name: Apply SAP HANA tuning profile via saptune
+      command: saptune solution apply HANA
+      changed_when: true
+      ignore_errors: true
+
+    - name: Enable saptune daemon
+      systemd:
+        name: saptune
+        enabled: true
+        state: started
+      ignore_errors: true
+
+    - name: Check if aws cli is present
+      command: which aws
+      register: aws_cli_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download and install AWS CLI v2
+      shell: |
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        unzip -q /tmp/awscliv2.zip -d /tmp/awscli-install
+        /tmp/awscli-install/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+        rm -rf /tmp/awscliv2.zip /tmp/awscli-install
+      when: aws_cli_check.rc != 0
+
+    - name: Fail if S3 bucket not specified
+      fail:
+        msg: "hana_s3_bucket must be set (e.g. -e hana_s3_bucket=my-bucket)"
+      when: hana_s3_bucket == ""
+
+    - name: Create remote media staging directory
+      file:
+        path: "{{ hana_media_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Sync HANA media from S3
+      command: >
+        aws s3 sync s3://{{ hana_s3_bucket }}/{{ hana_s3_prefix }}/ {{ hana_media_dir }}/
+        --no-progress
+      register: s3_sync
+      changed_when: "'download' in s3_sync.stdout"
+
+    - name: Find hdblcm installer
+      find:
+        paths: "{{ hana_media_dir }}"
+        patterns: "hdblcm"
+        recurse: true
+      register: hdblcm_find
+
+    - name: Fail if hdblcm not found
+      fail:
+        msg: "hdblcm not found under {{ hana_media_dir }} — check hana_s3_bucket and hana_s3_prefix"
+      when: hdblcm_find.files | length == 0
+
+    - name: Set hdblcm path fact
+      set_fact:
+        hdblcm_path: "{{ hdblcm_find.files[0].path }}"
+
+    - name: Make hdblcm executable
+      file:
+        path: "{{ hdblcm_path }}"
+        mode: "0755"
+
+    - name: Write hdblcm silent response file
+      template:
+        src: hana_install.cfg.j2
+        dest: /tmp/hana_install.cfg
+        mode: "0600"
+        force: true
+
+    - name: Move LSS media aside
+      command: mv {{ hana_media_dir }}/lss {{ hana_media_dir }}/lss_aside
+      args:
+        removes: "{{ hana_media_dir }}/lss"
+
+    - name: Make media directory fully executable
+      shell: chmod -R 755 {{ hana_media_dir }}
+      changed_when: true
+
+    - name: Check if HANA already installed
+      stat:
+        path: "/usr/sap/{{ hana_sid }}/HDB{{ hana_instance }}/exe/hdbnsutil"
+      register: hana_installed
+
+    - name: Run SAP HANA installation (hdblcm)
+      command: >
+        {{ hdblcm_path }} --batch --configfile=/tmp/hana_install.cfg
+      register: hdblcm_result
+      changed_when: true
+      async: 3600
+      poll: 30
+      when: not hana_installed.stat.exists
+
+    - name: Show hdblcm output
+      debug:
+        msg: "{{ hdblcm_result.stdout_lines | default(['HANA already installed, skipped']) }}"
+
+    - name: Set HANA filesystem ownership
+      file:
+        path: "{{ item }}"
+        owner: hdbadm
+        group: sapsys
+        recurse: true
+      loop:
+        - "{{ hana_data_dir }}"
+        - "{{ hana_log_dir }}"
+        - "{{ hana_install_dir }}"
+        - "/hana/backup"
+
+    - name: Check HDB daemon is running
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB info" 2>&1 | grep -E "hdbdaemon|hdbnameserver"
+      register: hdb_info
+      changed_when: false
+      failed_when: hdb_info.rc != 0
+
+    - name: Confirm HANA installation complete
+      debug:
+        msg: >
+          SAP HANA {{ hana_sid }} instance {{ hana_instance }} installed successfully.
+          Connect: hdbsql -i {{ hana_instance }} -u SYSTEM -p <password>
