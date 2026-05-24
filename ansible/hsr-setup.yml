@@ -7,7 +7,7 @@
   vars:
     hana_sid: "HDB"
     hana_instance: "00"
-    hana_master_pw: "Hana1234!"
+    hana_master_pw: "{{ lookup('env', 'HANA_MASTER_PW') }}"
     hsr_replication_mode: "syncmem"
     hsr_operation_mode: "logreplay"
     hsr_site_name_primary: "SITE1"
@@ -124,7 +124,7 @@
   vars:
     hana_sid: "HDB"
     hana_instance: "00"
-    hana_master_pw: "Hana1234!"
+    hana_master_pw: "{{ lookup('env', 'HANA_MASTER_PW') }}"
     hsr_replication_mode: "syncmem"
     hsr_operation_mode: "logreplay"
     hsr_site_name_secondary: "SITE2"
